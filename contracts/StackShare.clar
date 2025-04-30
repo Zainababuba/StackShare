@@ -97,3 +97,141 @@
         ERR-INVALID-INPUT
     )
 )
+
+(define-private (validate-file-description-length (description (string-ascii 256)))
+    (if (>= (len description) minimum-description-length)
+        (ok true)
+        ERR-INVALID-INPUT
+    )
+)
+
+(define-private (validate-access-expiration (expiration-timestamp (optional uint)))
+    (match expiration-timestamp
+        timestamp (if (> timestamp block-height)
+            (ok true)
+            ERR-INVALID-INPUT)
+        (ok true)
+    )
+)
+
+(define-private (check-file-access-permission (file-identifier uint) (requesting-user principal))
+    (match (map-get? file-registry { file-identifier: file-identifier })
+        file-record 
+            (let ((access-entry (map-get? file-access-control { file-identifier: file-identifier, accessing-user: requesting-user })))
+                (or 
+                    (is-eq (get file-owner file-record) requesting-user)
+                    (not (get is-file-private file-record))
+                    (match access-entry
+                        permission (and 
+                            (get user-can-access permission)
+                            (match (get access-permission-expiration permission)
+                                expiration-time (> expiration-time block-height)
+                                true
+                            )
+                        )
+                        false
+                    )
+                )
+            )
+        false
+    )
+)
+
+(define-private (check-file-edit-permission (file-identifier uint) (requesting-user principal))
+    (match (map-get? file-access-control { file-identifier: file-identifier, accessing-user: requesting-user })
+        permission (and
+            (get user-can-edit permission)
+            (match (get access-permission-expiration permission)
+                expiration-time (> expiration-time block-height)
+                true
+            )
+        )
+        false
+    )
+)
+
+(define-private (update-user-storage-metrics (user-principal principal) (storage-size-change int))
+    (let (
+        (current-storage-metrics (default-to 
+            { total-user-files: u0, total-user-storage-consumed: u0, last-user-upload-timestamp: u0 }
+            (map-get? user-storage-metrics { storage-user: user-principal })
+        ))
+        (new-total-files (+ (get total-user-files current-storage-metrics) u1))
+        (new-storage-consumed (+ (get total-user-storage-consumed current-storage-metrics) 
+            (if (> storage-size-change 0) 
+                (to-uint storage-size-change) 
+                (if (>= (get total-user-storage-consumed current-storage-metrics) (to-uint (if (< storage-size-change 0) (- 0 storage-size-change) storage-size-change)))
+                    (to-uint (if (< storage-size-change 0) (- 0 storage-size-change) storage-size-change))
+                    u0
+                )
+            )))
+    )
+        (map-set user-storage-metrics
+            { storage-user: user-principal }
+            {
+                total-user-files: new-total-files,
+                total-user-storage-consumed: new-storage-consumed,
+                last-user-upload-timestamp: block-height
+            }
+        )
+    )
+)
+
+;; Public Functions
+(define-public (upload-new-file 
+    (file-name (string-ascii 64)) 
+    (file-cryptographic-hash (string-ascii 64)) 
+    (file-byte-size uint)
+    (file-content-type (string-ascii 32))
+    (file-description (string-ascii 256))
+    (is-file-private bool)
+    (is-file-encrypted bool)
+    (file-tags (list 10 (string-ascii 32)))
+)
+    (let (
+        (new-file-identifier (+ (var-get next-file-identifier) u1))
+        (user-storage-info (default-to 
+            { total-user-files: u0, total-user-storage-consumed: u0, last-user-upload-timestamp: u0 }
+            (map-get? user-storage-metrics { storage-user: tx-sender })
+        ))
+    )
+        ;; Input validation
+        (try! (validate-file-name-length file-name))
+        (try! (validate-file-description-length file-description))
+        (asserts! (<= file-byte-size maximum-allowed-file-size) ERR-INVALID-INPUT)
+        (asserts! (< (get total-user-files user-storage-info) maximum-files-per-user-limit) ERR-STORAGE-LIMIT-EXCEEDED)
+
+        (var-set next-file-identifier new-file-identifier)
+        (map-set file-registry
+            { file-identifier: new-file-identifier }
+            {
+                file-owner: tx-sender,
+                file-name: file-name,
+                file-cryptographic-hash: file-cryptographic-hash,
+                file-byte-size: file-byte-size,
+                file-upload-timestamp: block-height,
+                file-last-modified-timestamp: block-height,
+                file-content-type: file-content-type,
+                file-description: file-description,
+                is-file-private: is-file-private,
+                is-file-encrypted: is-file-encrypted,
+                file-version-number: u1
+            }
+        )
+
+        (map-set file-tag-index { file-identifier: new-file-identifier } { tag-collection: file-tags })
+        (map-set file-version-tracking
+            { file-identifier: new-file-identifier, version-identifier: u1 }
+            {
+                version-file-hash: file-cryptographic-hash,
+                version-file-size: file-byte-size,
+                version-modified-by: tx-sender,
+                version-modification-timestamp: block-height,
+                version-change-description: "Initial upload"
+            }
+        )
+
+        (update-user-storage-metrics tx-sender (to-int file-byte-size))
+        (ok new-file-identifier)
+    )
+)
